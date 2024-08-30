@@ -22,20 +22,25 @@ import io.airlift.http.client.StatusResponseHandler.StatusResponse;
 import io.trino.aws.proxy.server.security.opa.ForOpa;
 import io.trino.aws.proxy.server.testing.TestingTrinoAwsProxyServer;
 import io.trino.aws.proxy.server.testing.containers.OpaContainer;
+import io.trino.aws.proxy.server.testing.containers.S3Container.ForS3Container;
 import io.trino.aws.proxy.server.testing.harness.BuilderFilter;
 import io.trino.aws.proxy.server.testing.harness.TrinoAwsProxyTest;
 import io.trino.aws.proxy.spi.credentials.Identity;
 import io.trino.aws.proxy.spi.rest.ParsedS3Request;
+import io.trino.aws.proxy.spi.security.SecurityResponse;
+import io.trino.aws.proxy.spi.security.opa.OpaClient;
 import io.trino.aws.proxy.spi.security.opa.OpaRequest;
 import io.trino.aws.proxy.spi.security.opa.OpaS3SecurityMapper;
 import jakarta.ws.rs.core.UriBuilder;
 import org.assertj.core.api.InstanceOfAssertFactories;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 
+import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Optional;
@@ -44,6 +49,7 @@ import static io.airlift.http.client.Request.Builder.preparePut;
 import static io.airlift.http.client.StaticBodyGenerator.createStaticBodyGenerator;
 import static io.airlift.http.client.StatusResponseHandler.createStatusResponseHandler;
 import static io.trino.aws.proxy.server.security.opa.OpaS3SecurityModule.OPA_S3_SECURITY_IDENTIFIER;
+import static io.trino.aws.proxy.server.testing.TestingUtil.getFileFromStorage;
 import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -54,6 +60,7 @@ public class TestOpaSecurity
     private final HttpClient httpClient;
     private final int containerPort;
     private final S3Client s3Client;
+    private final S3Client storageClient;
 
     public static class Filter
             implements BuilderFilter
@@ -73,19 +80,29 @@ public class TestOpaSecurity
             implements OpaS3SecurityMapper
     {
         private final int containerPort;
+        private final OpaClient opaClient;
 
         @Inject
-        public OpaMapper(OpaContainer container)
+        public OpaMapper(OpaContainer container, OpaClient opaClient)
         {
             containerPort = container.getPort();
+            this.opaClient = requireNonNull(opaClient, "opaClient is null");
         }
 
         @Override
-        public OpaRequest toRequest(ParsedS3Request request, Optional<String> lowercaseAction, URI baseUri, Optional<Identity> identity)
+        public SecurityResponse apply(ParsedS3Request request, Optional<String> lowercaseAction, URI baseUri, Optional<Identity> identity)
         {
             assertThat(identity).isPresent();
+            if (request.keyInBucket().equals("default-allow")) {
+                return SecurityResponse.SUCCESS;
+            }
+            if (request.keyInBucket().equals("default-deny")) {
+                return SecurityResponse.FAILURE;
+            }
+
             URI uri = UriBuilder.fromUri(baseUri).port(containerPort).path("test").path("allow").build();
-            return new OpaRequest(uri, ImmutableMap.of("table", request.keyInBucket()));
+            OpaRequest opaRequest = new OpaRequest(uri, ImmutableMap.of("table", request.keyInBucket()));
+            return opaClient.requestSecurityResponse(opaRequest);
         }
     }
 
@@ -100,11 +117,12 @@ public class TestOpaSecurity
             """;
 
     @Inject
-    public TestOpaSecurity(@ForOpa HttpClient httpClient, OpaContainer container, S3Client s3Client)
+    public TestOpaSecurity(@ForOpa HttpClient httpClient, OpaContainer container, S3Client s3Client, @ForS3Container S3Client storageClient)
     {
         this.httpClient = requireNonNull(httpClient, "httpClient is null");
         containerPort = container.getPort();
         this.s3Client = requireNonNull(s3Client, "s3Client is null");
+        this.storageClient = requireNonNull(storageClient, "storageClient is null");
     }
 
     @BeforeAll
@@ -117,6 +135,8 @@ public class TestOpaSecurity
 
         StatusResponse response = httpClient.execute(request, createStatusResponseHandler());
         assertThat(response.getStatusCode()).isEqualTo(200);
+
+        storageClient.createBucket(r -> r.bucket("opa-test-bucket"));
     }
 
     @Test
@@ -135,5 +155,50 @@ public class TestOpaSecurity
                 .asInstanceOf(InstanceOfAssertFactories.type(S3Exception.class))
                 .extracting(S3Exception::statusCode)
                 .isEqualTo(404);    // table: good is allowed but does not exist
+    }
+
+    @Test
+    public void testOPAPolicyAllowance() throws IOException
+    {
+        String bucket = "opa-test-bucket", key = "good", content = "test-content";
+        storageClient.putObject(r -> r.bucket(bucket).key(key), RequestBody.fromString(content));
+
+        String expected = getFileFromStorage(s3Client, bucket, key);
+
+        assertThat(expected).isEqualTo(content);
+    }
+
+    @Test
+    public void testOPAPolicyDisAllowance()
+    {
+        String bucket = "opa-test-bucket", key = "bad", content = "test-content";
+        storageClient.putObject(r -> r.bucket(bucket).key(key), RequestBody.fromString(content));
+
+        assertThatThrownBy(() -> s3Client.getObject(GetObjectRequest.builder().bucket(bucket).key(key).build()))
+                .asInstanceOf(InstanceOfAssertFactories.type(S3Exception.class))
+                .extracting(S3Exception::statusCode)
+                .isEqualTo(401);
+    }
+
+    @Test
+    public void testFastrackSuccess() throws IOException {
+        String bucket = "opa-test-bucket", key = "default-allow", content = "test-content";
+        storageClient.putObject(r -> r.bucket(bucket).key(key), RequestBody.fromString(content));
+
+        String expected = getFileFromStorage(s3Client, bucket, key);
+
+        assertThat(expected).isEqualTo(content);
+    }
+
+    @Test
+    public void testFastrackFailure()
+    {
+        String bucket = "opa-test-bucket", key = "default-deny", content = "test-content";
+        storageClient.putObject(r -> r.bucket(bucket).key(key), RequestBody.fromString(content));
+
+        assertThatThrownBy(() -> s3Client.getObject(GetObjectRequest.builder().bucket(bucket).key(key).build()))
+                .asInstanceOf(InstanceOfAssertFactories.type(S3Exception.class))
+                .extracting(S3Exception::statusCode)
+                .isEqualTo(401);
     }
 }

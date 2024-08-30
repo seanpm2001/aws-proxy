@@ -13,15 +13,9 @@
  */
 package io.trino.aws.proxy.spi.security.opa;
 
-import io.trino.aws.proxy.spi.credentials.Identity;
-import io.trino.aws.proxy.spi.rest.ParsedS3Request;
 import io.trino.aws.proxy.spi.security.SecurityResponse;
 
-import java.net.URI;
-import java.util.Optional;
-
-@FunctionalInterface
-public interface OpaS3SecurityMapper
+public interface OpaClient
 {
-    SecurityResponse apply(ParsedS3Request request, Optional<String> lowercaseAction, URI baseUri, Optional<Identity> identity);
+    SecurityResponse requestSecurityResponse(OpaRequest request);
 }
